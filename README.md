@@ -88,6 +88,46 @@ workers started within the block, and it makes the actor invisible at the call
 site. `resolve_actor()` therefore never reads it unless asked with
 `ambient=True`.
 
+## Recording changes on save
+
+Recording is opt-in per model. `register()` connects the `post_init` and
+`post_save` signals for that model; every other model stays untouched.
+
+```python
+from model_audit import register, subscribe
+
+register(Invoice, exclude=["search_vector"])
+
+@subscribe
+def write_to_log(record):
+    print(record.action, record.model, record.pk, record.changes.as_dict())
+
+invoice.total = 120
+invoice.save()
+# updated app.Invoice 7 {'total': (100, 120)}
+```
+
+A record carries the model label, the primary key, the `Action` (`CREATED` or
+`UPDATED`), the actor, the `Changeset` and a timestamp; `record.as_dict()`
+flattens all of it for logging. Since signals carry no call-site actor, the
+recorder reads the ambient one — wrap the request or job in `actor_context()`
+to attribute the change, otherwise it is recorded as `UNKNOWN`.
+
+The fields being compared are chosen at registration:
+
+- `exclude=[...]` drops single fields, `fields=[...]` narrows to an allow-list.
+  A foreign key can be named either way (`author` or `author_id`).
+- Timestamps that every save touches (`updated_at`, `modified`, …) are dropped
+  by default; they are listed in `NOISY_FIELDS` and kept with
+  `ignore_noisy=False`.
+- Deferred fields are skipped, and relations are read by their stored id, so
+  snapshotting never issues an extra query.
+
+A creation reports every audited field as an addition. An update with
+`save(update_fields=[...])` is narrowed to those fields, and an update that
+changed nothing emits no record at all. `unregister(Invoice)` stops recording,
+`is_registered()` and `registered_models()` report the current state.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
