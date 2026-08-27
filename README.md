@@ -122,11 +122,63 @@ The fields being compared are chosen at registration:
   `ignore_noisy=False`.
 - Deferred fields are skipped, and relations are read by their stored id, so
   snapshotting never issues an extra query.
+- Values that look sensitive are withheld before the record is handed out; see
+  [Redaction](#redaction).
 
 A creation reports every audited field as an addition. An update with
 `save(update_fields=[...])` is narrowed to those fields, and an update that
 changed nothing emits no record at all. `unregister(Invoice)` stops recording,
 `is_registered()` and `registered_models()` report the current state.
+
+## Redaction
+
+An audit trail records *that* a field changed; it must not become a second copy
+of the data it watches. Values of fields whose name reads like a secret, a
+phone number or an identity document are replaced by `REDACTED` before a record
+reaches any receiver.
+
+```python
+from model_audit import REDACTED, Redactor, redact_data, register
+
+register(Customer)
+
+customer.phone = "+31 6 1234 5678"
+customer.auth_token = "tok_live_9f3"
+customer.save()
+# updated app.Customer 7 {'phone': (REDACTED, REDACTED), 'auth_token': (REDACTED, REDACTED)}
+```
+
+`REDACTED` is a `str` (`"[redacted]"`), so a record still serializes to JSON
+without special-casing, while `value is REDACTED` separates it from a value
+that merely looks like one. A field absent from one side keeps its `MISSING`,
+so an addition still reads as one.
+
+Matching is a case-insensitive substring test against `SENSITIVE_FIELDS` —
+`token`, `password`, `secret`, `phone`, `passport`, `document`, `iban`, `ssn`
+and their neighbours. Personal data that no default can guess is named per
+model, and a field caught by mistake is released:
+
+```python
+register(Customer, redact=["nickname", "birthday"])
+register(Shipment, redact=Redactor(allow=["document_type"]))
+```
+
+`exclude` and `redact` answer different questions: an excluded field is not
+audited at all, a redacted one is audited by name with its values withheld.
+Redaction is the safer default of the two — an excluded field leaves no trace
+that it was ever touched.
+
+Nothing here is tied to models. `redact()` takes a `Changeset`, and
+`redact_data()` walks nested mappings and lists, which is the shape a request
+or response body has on its way to a log sink:
+
+```python
+redact_data({"user": {"phone": "+31 6 1234 5678", "city": "Utrecht"}})
+# {'user': {'phone': '[redacted]', 'city': 'Utrecht'}}
+```
+
+Email addresses are not redacted by default, since many trails are read by
+them; add `redact=["email"]` where they count as personal data.
 
 ## License
 

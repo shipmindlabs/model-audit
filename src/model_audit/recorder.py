@@ -21,6 +21,7 @@ from django.utils import timezone
 
 from model_audit.actor import Actor, resolve_actor
 from model_audit.diff import Changeset, diff
+from model_audit.redaction import DEFAULT_REDACTOR, Redactor
 
 __all__ = [
     "NOISY_FIELDS",
@@ -84,6 +85,7 @@ Receiver = Callable[[AuditRecord], None]
 class _Registration:
     fields: frozenset[str] | None
     exclude: frozenset[str]
+    redactor: Redactor
 
 
 _registrations: dict[type[Model], _Registration] = {}
@@ -96,6 +98,7 @@ def register(
     fields: Iterable[str] | None = None,
     exclude: Iterable[str] | None = None,
     ignore_noisy: bool = True,
+    redact: Redactor | Iterable[str] | None = None,
 ) -> type[Model]:
     """Start recording saves of ``model``.
 
@@ -103,6 +106,10 @@ def register(
     fields from it. Both accept a foreign key by its name or by its column
     attribute (``author`` or ``author_id``). Registering twice replaces the
     previous configuration.
+
+    Values of sensitive fields are withheld from every record. ``redact``
+    takes extra field names to treat as sensitive, or a whole
+    :class:`~model_audit.redaction.Redactor` when the defaults need replacing.
     """
     excluded = set(exclude or ())
     if ignore_noisy:
@@ -111,6 +118,7 @@ def register(
     _registrations[model] = _Registration(
         fields=frozenset(fields) if fields is not None else None,
         exclude=frozenset(excluded),
+        redactor=_coerce_redactor(redact),
     )
 
     uid = _dispatch_uid(model)
@@ -146,6 +154,14 @@ def subscribe(receiver: Receiver) -> Receiver:
 def unsubscribe(receiver: Receiver) -> None:
     if receiver in _receivers:
         _receivers.remove(receiver)
+
+
+def _coerce_redactor(redact: Redactor | Iterable[str] | None) -> Redactor:
+    if redact is None:
+        return DEFAULT_REDACTOR
+    if isinstance(redact, Redactor):
+        return redact
+    return DEFAULT_REDACTOR.extend(redact)
 
 
 def _dispatch_uid(model: type[Model]) -> str:
@@ -222,7 +238,7 @@ def _on_post_save(
         pk=instance.pk,
         action=Action.CREATED if created else Action.UPDATED,
         actor=resolve_actor(None, ambient=True),
-        changes=changes,
+        changes=registration.redactor.changeset(changes),
         at=timezone.now(),
     )
     for receiver in tuple(_receivers):

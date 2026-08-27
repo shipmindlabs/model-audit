@@ -24,13 +24,25 @@ from model_audit.recorder import (
     unregister,
     unsubscribe,
 )
+from model_audit.redaction import (
+    DEFAULT_REDACTOR,
+    REDACTED,
+    SENSITIVE_FIELDS,
+    Redactor,
+    is_sensitive,
+    redact,
+    redact_data,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
     "ANONYMOUS",
+    "DEFAULT_REDACTOR",
     "MISSING",
     "NOISY_FIELDS",
+    "REDACTED",
+    "SENSITIVE_FIELDS",
     "SYSTEM",
     "UNKNOWN",
     "Action",
@@ -39,10 +51,14 @@ __all__ = [
     "AuditRecord",
     "Changeset",
     "FieldChange",
+    "Redactor",
     "actor_context",
     "current_actor",
     "diff",
     "is_registered",
+    "is_sensitive",
+    "redact",
+    "redact_data",
     "register",
     "registered_models",
     "reset_current_actor",
