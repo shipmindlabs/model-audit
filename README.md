@@ -180,6 +180,79 @@ redact_data({"user": {"phone": "+31 6 1234 5678", "city": "Utrecht"}})
 Email addresses are not redacted by default, since many trails are read by
 them; add `redact=["email"]` where they count as personal data.
 
+## HTTP requests
+
+Which endpoints are audited, and how much of each request is kept, is declared
+in one map. The middleware only looks the request up there, so the answer to
+"is this endpoint audited, and what does it record?" is read in a single place
+instead of reconstructed from conditions inside the middleware.
+
+```python
+from model_audit import AuditRoute, Capture, audit_routes, subscribe_requests
+
+audit_routes({
+    "/api/**": False,                                   # audited by exception
+    "/api/orders/**": Capture.QUERY,
+    "POST /api/orders/*/refund": AuditRoute(Capture.FULL, label="refund"),
+    "POST,DELETE /api/sessions": AuditRoute(Capture.HEADERS, label="sign-in"),
+})
+
+@subscribe_requests
+def write_to_log(record):
+    print(record.method, record.path, record.status, record.label, record.payload)
+```
+
+Then add the middleware, after the authentication one:
+
+```python
+MIDDLEWARE = [
+    ...,
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "model_audit.http.AuditMiddleware",
+]
+```
+
+The map may also live in settings as `MODEL_AUDIT_ROUTES`, in the same shape;
+the middleware reads it once when Django builds the chain. Declaring it from
+code instead (an `AppConfig.ready()`) keeps route objects and their redactors
+out of the settings module.
+
+### Reading the map
+
+- A pattern matches by path segment: `*` stands for one segment, `**` for any
+  number of trailing ones.
+- A key may name the verbs it applies to (`"POST,DELETE /api/sessions"`), which
+  is the same as passing `methods=[...]` to the route; `WRITE_METHODS` is
+  `POST`, `PUT`, `PATCH` and `DELETE`.
+- The most specific declaration wins — more literal segments first, then an
+  explicit method list, then a pattern without `**`. A broad `"/api/**": False`
+  is therefore a default, not a veto: any endpoint below it can opt back in.
+- `False` and `AuditRoute.off()` mean the same thing: matched in order to be
+  left out. An unmatched path costs the lookup and nothing else — no body is
+  read, no actor is resolved.
+
+### What a route captures
+
+`Capture.NOTHING` (the default) still records that the request happened: verb,
+path, matched pattern, label, status, actor, duration and timestamp. The flags
+add payloads — `QUERY`, `BODY`, `HEADERS`, `RESPONSE`, or `FULL` for all four —
+under `record.payload`, and `record.as_dict()` flattens the lot.
+
+Captured payloads go through [redaction](#redaction) first, with `Cookie` and
+`Authorization` withheld from headers; pass `redactor=` on the route where an
+endpoint carries personal data the defaults cannot guess. Bodies are read only
+for form and JSON content types and only up to 64 KB (`MAX_BODY_BYTES`);
+anything else is recorded as an `{"omitted": ...}` note rather than dropped
+silently, so the trail says why a body is not there.
+
+A view that raises is recorded too, with `status=None` and `error` naming the
+exception class, before the exception continues on its way.
+
+For the duration of an audited request the actor is bound as the ambient one,
+so model records written by the view are attributed to the same party without
+threading anything through. The record's own actor is resolved after the view,
+which is what makes a sign-in endpoint report the user it authenticated.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
