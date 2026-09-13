@@ -203,8 +203,11 @@ def _on_post_init(sender: type[Model], instance: Model, **kwargs: Any) -> None:
     registration = _registrations.get(sender)
     if registration is None:
         return
-    stored = {} if instance._state.adding else _snapshot(instance, registration)
-    setattr(instance, _STATE_ATTR, stored)
+    # The signal fires from inside ``Model.__init__``, and ``from_db`` clears
+    # ``_state.adding`` only afterwards, so the flag cannot tell a loaded row
+    # from a new one here. A snapshot of a new row is harmless: ``post_save``
+    # diffs a creation against an empty one regardless.
+    setattr(instance, _STATE_ATTR, _snapshot(instance, registration))
 
 
 def _on_post_save(
