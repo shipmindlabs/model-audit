@@ -18,6 +18,57 @@ pip install model-audit
 - Python 3.10+
 - Django 4.2+
 
+## Quickstart
+
+The library records; it never stores. Declare what is audited, subscribe a
+receiver, and send the records wherever your project already keeps its logs.
+
+```python
+# billing/apps.py
+import logging
+
+from django.apps import AppConfig
+
+log = logging.getLogger("audit")
+
+
+def write(record):
+    log.info("%s", record.as_dict())
+
+
+class BillingConfig(AppConfig):
+    name = "billing"
+
+    def ready(self):
+        from model_audit import audit_routes, register, subscribe, subscribe_requests
+
+        from billing.models import Invoice
+
+        register(Invoice, exclude=["search_vector"])
+        audit_routes({"POST,PUT,PATCH,DELETE /api/invoices/**": True})
+
+        subscribe(write)            # model saves
+        subscribe_requests(write)   # http requests
+```
+
+```python
+# settings.py
+MIDDLEWARE = [
+    ...,
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "model_audit.http.AuditMiddleware",
+]
+```
+
+That is the whole integration. A saved invoice now emits a record naming the
+fields that changed and the party the request was handled for; every other
+model stays untouched, and a path the route map does not match costs a lookup
+and nothing else.
+
+The rest of this file is the detail behind those four calls: what a diff
+counts as a change, how an actor is resolved, what a route captures, where the
+records should land, and which fields must never reach them.
+
 ## Field-level diffs
 
 The diff core is framework-free: it compares two mappings of field values and
@@ -252,6 +303,105 @@ For the duration of an audited request the actor is bound as the ambient one,
 so model records written by the view are attributed to the same party without
 threading anything through. The record's own actor is resolved after the view,
 which is what makes a sign-in endpoint report the user it authenticated.
+
+## Where the records go
+
+There is no audit table here, no storage setting and no migration: the library
+builds records and hands them to the receivers you subscribed. Three
+destinations cover most projects.
+
+**A log sink.** `record.as_dict()` is plain JSON-serializable data, so a
+structured logger is the whole integration, and retention is whatever your log
+pipeline already enforces. This is the right default when the trail is read
+during an incident rather than queried per row.
+
+```python
+import logging
+
+from model_audit import subscribe
+
+log = logging.getLogger("audit")
+
+@subscribe
+def write_to_log(record):
+    log.info("audit", extra={"audit": record.as_dict()})
+```
+
+**A table.** A model holding `model`, `pk`, `actor`, `changes` (a `JSONField`)
+and `at`, indexed on `(model, pk, at)`, answers "what happened to this row, and
+who did it" in one query. Receivers run inside `post_save`, so the insert joins
+whatever transaction the caller opened: a rolled-back save leaves no trail
+entry either. The price is that the trail now lives in the database it audits,
+inherits its backups and its exports, and grows faster than the rows it
+watches — see [retention](#retention) before choosing this one.
+
+**A queue.** Receivers are called synchronously, on the thread that saved the
+row or served the request. When the destination is a broker, a search cluster
+or a third-party API, enqueue the record and let a worker do the delivery;
+anything that can block or fail slowly does not belong on the request path.
+
+Two properties are worth knowing before writing a receiver: they are called in
+subscription order, and their exceptions are not swallowed. A receiver that
+raises takes the `save()` — or the already-successful request — down with it.
+Keep it to a serialize-and-hand-off and let the sink's own client retry.
+
+## What to audit, and what never to
+
+Audit **decisions**: state transitions, role and permission grants, amounts and
+currencies, ownership changes, consent flags, sign-in and sign-out, anything an
+administrator can do to someone else's data. These are the facts a trail exists
+to answer for, and their values are small, stable and safe to keep.
+
+Never audit **content that can stand in for the person**: credentials, tokens
+and anything else that lets a reader act as the user; identity documents and
+payment instruments; free-text fields that users fill with whatever they like;
+special-category data such as health, biometrics or beliefs. For these, either
+exclude the field — it leaves no trace at all — or redact it, which keeps the
+fact that it changed without keeping the value. Prefer redaction: "the passport
+number was edited on Tuesday by an agent" is exactly the sentence a trail is
+for, and it does not need the number to say it.
+
+Two further rules earned the hard way. Do not audit a table that is already a
+log — sessions, events, outbox rows — or the trail doubles the traffic it was
+meant to summarize. And do not audit a model "for now, we will trim it later":
+the trimming is a data migration over history, which is far more work than the
+narrower registration would have been.
+
+### The mistake the defaults are built around
+
+The code this package grew out of did the obvious thing first: on every save of
+the customer profile it serialized the whole row into a JSON column on an
+`audit_log` table. It worked, it was one function, and for a year nobody looked
+at it. The profile carried a phone number, a passport number and a support
+agent's free-text notes, so every edit wrote another full copy of all three.
+
+The bill arrived with the first deletion request. The profile row was deleted
+in seconds — and the audit table still held every value that row had ever had,
+including the ones the deletion was supposed to remove. The trail had quietly
+become the last remaining copy of the data. Worse, it was the copy nobody had
+classified, because it looked like infrastructure rather than personal data.
+The fix was a migration that rewrote two years of history in place, reviewed by
+people who had not asked for an audit trail in the first place.
+
+Three defaults here come straight out of that:
+
+- Redaction is on by name and by default, not opt-in. A field called
+  `passport_number` is withheld whether or not anyone remembered to declare it.
+- Auditing is opt-in per model, and the compared fields are chosen at
+  registration. "Everything, just in case" is not available on purpose.
+- Every record carries `at`, and nothing is stored for you. The trail's
+  lifetime is a decision the project has to make, not one the library makes by
+  quietly inserting rows forever.
+
+### Retention
+
+Give the trail a retention window no longer than the data it watches, and a job
+that enforces it — a `DELETE` by `at` on the table, or an expiry policy on the
+log index. Decide it when you subscribe the receiver, while the trail is empty
+and the decision is one line; after a year it is a migration. If subject-access
+or deletion requests apply to the audited data, they apply to the trail too:
+keep the record's `actor.id` and `pk` indexed so a subject's entries can be
+found and removed without a table scan.
 
 ## License
 
