@@ -47,7 +47,7 @@ class BillingConfig(AppConfig):
         register(Invoice, exclude=["search_vector"])
         audit_routes({"POST,PUT,PATCH,DELETE /api/invoices/**": True})
 
-        subscribe(write)            # model saves
+        subscribe(write)            # model saves and deletions
         subscribe_requests(write)   # http requests
 ```
 
@@ -141,8 +141,9 @@ site. `resolve_actor()` therefore never reads it unless asked with
 
 ## Recording changes on save
 
-Recording is opt-in per model. `register()` connects the `post_init` and
-`post_save` signals for that model; every other model stays untouched.
+Recording is opt-in per model. `register()` connects the `post_init`,
+`post_save` and `post_delete` signals for that model; every other model stays
+untouched.
 
 ```python
 from model_audit import register, subscribe
@@ -158,11 +159,12 @@ invoice.save()
 # updated app.Invoice 7 {'total': (100, 120)}
 ```
 
-A record carries the model label, the primary key, the `Action` (`CREATED` or
-`UPDATED`), the actor, the `Changeset` and a timestamp; `record.as_dict()`
-flattens all of it for logging. Since signals carry no call-site actor, the
-recorder reads the ambient one — wrap the request or job in `actor_context()`
-to attribute the change, otherwise it is recorded as `UNKNOWN`.
+A record carries the model label, the primary key, the `Action` (`CREATED`,
+`UPDATED` or `DELETED`), the actor, the `Changeset` and a timestamp;
+`record.as_dict()` flattens all of it for logging. Since signals carry no
+call-site actor, the recorder reads the ambient one — wrap the request or job
+in `actor_context()` to attribute the change, otherwise it is recorded as
+`UNKNOWN`.
 
 The fields being compared are chosen at registration:
 
@@ -180,6 +182,21 @@ A creation reports every audited field as an addition. An update with
 `save(update_fields=[...])` is narrowed to those fields, and an update that
 changed nothing emits no record at all. `unregister(Invoice)` stops recording,
 `is_registered()` and `registered_models()` report the current state.
+
+### Deletions
+
+A deletion is the mirror of a creation: one record per removed row, with every
+audited field reported as a removal — its stored value on the old side,
+`MISSING` on the new one — redacted and attributed exactly like a save.
+
+```python
+invoice.delete()
+# deleted app.Invoice 7 {'id': (7, MISSING), 'total': (120, MISSING), ...}
+```
+
+The primary key is still readable when the signal fires, so the record names
+the row that is gone. `QuerySet.delete()` emits one record per row rather than
+one per query, and a cascade emits one for each audited row it takes with it.
 
 ## Redaction
 

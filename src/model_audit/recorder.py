@@ -1,9 +1,10 @@
-"""Django adapter: record field changes when a model is saved.
+"""Django adapter: record field changes when a model is saved or deleted.
 
 Auditing is opt-in per model. ``register()`` connects ``post_init`` to keep a
-snapshot of the row as it was loaded and ``post_save`` to diff that snapshot
-against the instance that was written; the resulting record is handed to the
-subscribed receivers. Models that were never registered emit nothing.
+snapshot of the row as it was loaded, ``post_save`` to diff that snapshot
+against the instance that was written, and ``post_delete`` to report the row's
+audited fields as removals; the resulting record is handed to the subscribed
+receivers. Models that were never registered emit nothing.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from typing import Any
 
 from django.core.exceptions import FieldDoesNotExist
 from django.db.models import Model
-from django.db.models.signals import post_init, post_save
+from django.db.models.signals import post_delete, post_init, post_save
 from django.utils import timezone
 
 from model_audit.actor import Actor, resolve_actor
@@ -49,15 +50,16 @@ _STATE_ATTR = "_model_audit_stored"
 
 
 class Action(str, Enum):
-    """What the save did to the row."""
+    """What happened to the row."""
 
     CREATED = "created"
     UPDATED = "updated"
+    DELETED = "deleted"
 
 
 @dataclass(frozen=True, slots=True)
 class AuditRecord:
-    """One audited save: which row, by whom, and what changed."""
+    """One audited change: which row, by whom, and what changed."""
 
     model: str
     pk: Any
@@ -100,7 +102,7 @@ def register(
     ignore_noisy: bool = True,
     redact: Redactor | Iterable[str] | None = None,
 ) -> type[Model]:
-    """Start recording saves of ``model``.
+    """Start recording saves and deletions of ``model``.
 
     ``fields`` restricts auditing to an allow-list, ``exclude`` drops single
     fields from it. Both accept a foreign key by its name or by its column
@@ -124,16 +126,18 @@ def register(
     uid = _dispatch_uid(model)
     post_init.connect(_on_post_init, sender=model, dispatch_uid=uid, weak=False)
     post_save.connect(_on_post_save, sender=model, dispatch_uid=uid, weak=False)
+    post_delete.connect(_on_post_delete, sender=model, dispatch_uid=uid, weak=False)
     return model
 
 
 def unregister(model: type[Model]) -> None:
-    """Stop recording saves of ``model``; a no-op if it was not registered."""
+    """Stop recording ``model``; a no-op if it was not registered."""
     if _registrations.pop(model, None) is None:
         return
     uid = _dispatch_uid(model)
     post_init.disconnect(sender=model, dispatch_uid=uid)
     post_save.disconnect(sender=model, dispatch_uid=uid)
+    post_delete.disconnect(sender=model, dispatch_uid=uid)
 
 
 def is_registered(model: type[Model]) -> bool:
@@ -145,7 +149,7 @@ def registered_models() -> tuple[type[Model], ...]:
 
 
 def subscribe(receiver: Receiver) -> Receiver:
-    """Call ``receiver`` for every recorded save. Usable as a decorator."""
+    """Call ``receiver`` for every recorded change. Usable as a decorator."""
     if receiver not in _receivers:
         _receivers.append(receiver)
     return receiver
@@ -199,6 +203,11 @@ def _touched_attnames(model: type[Model], update_fields: Iterable[str]) -> set[s
     return attnames
 
 
+def _emit(record: AuditRecord) -> None:
+    for receiver in tuple(_receivers):
+        receiver(record)
+
+
 def _on_post_init(sender: type[Model], instance: Model, **kwargs: Any) -> None:
     registration = _registrations.get(sender)
     if registration is None:
@@ -236,13 +245,33 @@ def _on_post_save(
     if not changes and not created:
         return
 
-    record = AuditRecord(
-        model=sender._meta.label,
-        pk=instance.pk,
-        action=Action.CREATED if created else Action.UPDATED,
-        actor=resolve_actor(None, ambient=True),
-        changes=registration.redactor.changeset(changes),
-        at=timezone.now(),
+    _emit(
+        AuditRecord(
+            model=sender._meta.label,
+            pk=instance.pk,
+            action=Action.CREATED if created else Action.UPDATED,
+            actor=resolve_actor(None, ambient=True),
+            changes=registration.redactor.changeset(changes),
+            at=timezone.now(),
+        )
     )
-    for receiver in tuple(_receivers):
-        receiver(record)
+
+
+def _on_post_delete(sender: type[Model], instance: Model, **kwargs: Any) -> None:
+    registration = _registrations.get(sender)
+    if registration is None:
+        return
+
+    # The collector clears the primary key only after this signal, so the row
+    # the record names is still readable here, values included.
+    stored = _snapshot(instance, registration)
+    _emit(
+        AuditRecord(
+            model=sender._meta.label,
+            pk=instance.pk,
+            action=Action.DELETED,
+            actor=resolve_actor(None, ambient=True),
+            changes=registration.redactor.changeset(diff(stored, {})),
+            at=timezone.now(),
+        )
+    )
